@@ -7,6 +7,8 @@ korail2.korail2
 """
 
 import base64
+import hashlib
+import os
 try:
     import curl_cffi
     HAS_CURL_CFFI = True
@@ -15,17 +17,21 @@ except ImportError:
     HAS_CURL_CFFI = False
 import itertools
 import json
+import platform
 import re
+import secrets
 import time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from datetime import datetime, timedelta
 from functools import reduce
+from urllib.parse import quote_plus
 
 
 # Constants
 EMAIL_REGEX = re.compile(r"[^@]+@[^@]+\.[^@]+")
 PHONE_NUMBER_REGEX = re.compile(r"(\d{3})-(\d{3,4})-(\d{4})")
+PHONE_NUMBER_DIGITS_REGEX = re.compile(r"0\d{9,10}$")
 
 USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; SM-S912N Build/UP1A.231005.007)"
 
@@ -40,7 +46,8 @@ DEFAULT_HEADERS = {
 KORAIL_MOBILE = "https://smart.letskorail.com:443/classes/com.korail.mobile"
 API_ENDPOINTS = {
     "login": f"{KORAIL_MOBILE}.login.Login",
-    "logout": f"{KORAIL_MOBILE}.common.logout",
+    "logout": f"{KORAIL_MOBILE}.login.Logout",
+    "logout_legacy": f"{KORAIL_MOBILE}.common.logout",
     "search_schedule": f"{KORAIL_MOBILE}.seatMovie.ScheduleView",
     "reserve": f"{KORAIL_MOBILE}.certification.TicketReservation",
     "cancel": f"{KORAIL_MOBILE}.reservationCancel.ReservationCancelChk",
@@ -52,6 +59,20 @@ API_ENDPOINTS = {
     "refund": f"{KORAIL_MOBILE}.refunds.RefundsRequest",
     "code": f"{KORAIL_MOBILE}.common.code.do",
 }
+
+DEFAULT_KTX_VERSION = "250601002"
+SID_KEY = "2485dd54d9deaa36"
+DEFAULT_KTX_OS_VERSION = 34
+DEFAULT_KTX_DEVICE_WIDTH = 1080
+DEFAULT_KTX_DEVICE_HEIGHT = 2340
+COMMON_CODE_DATA = "app.var.data"
+DYNAPATH_PROTECTED_ENDPOINTS = {
+    "login",
+    "search_schedule",
+    "reserve",
+}
+DYNAPATH_PRIME_CACHE = []
+REDACTED_FIELDS = {"txtPwd", "x-dynapath-m-token"}
 
 
 # Schedule classes
@@ -515,13 +536,37 @@ class Korail:
             self._session = requests.session()
         self._session.headers.update(DEFAULT_HEADERS)
         self._device = "AD"
-        self._version = "240531001"
+        self._version = os.getenv("SRTGO_KTX_VERSION", DEFAULT_KTX_VERSION)
+        self._legacy_mode = os.getenv("SRTGO_KTX_LEGACY", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self._key = "korail1234567890"
         self._idx = None
         self.korail_id = korail_id
         self.korail_pw = korail_pw
         self.verbose = verbose
         self.logined = False
+        self._is_macro_active = None
+        self._dynapath_init_timestamp = int(time.time() * 1000)
+        self._dynapath_recent_timestamps = []
+        self._dynapath_package_name = os.getenv(
+            "SRTGO_KTX_PACKAGE_NAME", "com.korail.talk"
+        )
+        self._dynapath_android_id = os.getenv(
+            "SRTGO_KTX_ANDROID_ID",
+            ## hashlib.sha256(platform.node().encode("utf-8")).hexdigest()[:16],
+            "e6f8ef4dc4b0f42c",
+        )
+        self._dynapath_app_signature = os.getenv("SRTGO_KTX_APP_SIGNATURE", "[38ff229cb34c7dda8e28220a2d750cce]")
+        self._dynapath_rooted = os.getenv("SRTGO_KTX_ROOTED", "false").lower() == "true"
+        self._dynapath_debugger = os.getenv("SRTGO_KTX_DEBUGGER", "false").lower() == "true"
+        self._dynapath_emulator = os.getenv("SRTGO_KTX_EMULATOR", "false").lower() == "true"
+        self._dynapath_hooked = os.getenv("SRTGO_KTX_HOOKED", "false").lower() == "true"
+        self._dynapath_os_release = os.getenv("SRTGO_KTX_OS_RELEASE", "13")
+        self._dynapath_device_model = os.getenv("SRTGO_KTX_DEVICE_MODEL", "SM-S906N")
         self.membership_number = None
         self.name = None
         self.email = None
@@ -532,6 +577,328 @@ class Korail:
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(f"[*] {msg}")
+
+    def _request_json(self, method, endpoint, *, params=None, data=None, headers=None):
+        payload = params if params is not None else data if data is not None else {}
+        payload_key = "params" if method.upper() == "GET" else "data"
+        request_kwargs = {payload_key: payload}
+        if headers:
+            request_kwargs["headers"] = headers
+        self._log_request(method, endpoint, payload, headers)
+        response = getattr(self._session, method.lower())(endpoint, **request_kwargs)
+        self._log(response.text)
+        return json.loads(response.text)
+
+    def _sanitize_log_value(self, key, value):
+        if key == "txtPwd":
+            return "<redacted>"
+        if key == "x-dynapath-m-token":
+            value = str(value)
+            return f"{value[:16]}...<redacted>...{value[-8:]}" if len(value) > 24 else "<redacted>"
+        return value
+
+    def _sanitize_log_mapping(self, items):
+        if items is None:
+            return None
+        if isinstance(items, dict):
+            iterable = items.items()
+        else:
+            iterable = items
+        sanitized = []
+        for key, value in iterable:
+            sanitized.append((key, self._sanitize_log_value(key, value)))
+        return sanitized
+
+    def _log_request(self, method, endpoint, payload, headers):
+        if not self.verbose:
+            return
+        message = {
+            "method": method.upper(),
+            "url": endpoint,
+        }
+        if payload:
+            message["payload"] = self._sanitize_log_mapping(payload)
+        if headers:
+            message["headers"] = self._sanitize_log_mapping(headers.items())
+        self._log(f"REQUEST {json.dumps(message, ensure_ascii=False)}")
+
+    def _protected_endpoint_key(self, endpoint):
+        for key in DYNAPATH_PROTECTED_ENDPOINTS:
+            if endpoint == API_ENDPOINTS[key]:
+                return key
+        return None
+
+    def _dynapath_primes(self, count):
+        if len(DYNAPATH_PRIME_CACHE) >= count:
+            return DYNAPATH_PRIME_CACHE[:count]
+
+        candidate = DYNAPATH_PRIME_CACHE[-1] + 2 if DYNAPATH_PRIME_CACHE else 2
+        while len(DYNAPATH_PRIME_CACHE) < count:
+            is_prime = True
+            limit = int(candidate**0.5)
+            for prime in DYNAPATH_PRIME_CACHE:
+                if prime > limit:
+                    break
+                if candidate % prime == 0:
+                    is_prime = False
+                    break
+            if is_prime:
+                DYNAPATH_PRIME_CACHE.append(candidate)
+            candidate = 3 if candidate == 2 else candidate + 2
+        return DYNAPATH_PRIME_CACHE[:count]
+
+    def _dynapath_d(self, length):
+        value = 1
+        for prime in self._dynapath_primes(100):
+            if prime <= length:
+                value = prime
+        return value
+
+    def _dynapath_c(self, value, decode, encode):
+        length = len(value)
+        d_value = self._dynapath_d(length)
+        used = [0] * d_value
+        chars = [""] * d_value
+        multiplier = 1
+        for idx in range(d_value):
+            target = ((multiplier % d_value) * encode) % d_value
+            used[target] += 1
+            if used[target] == 1:
+                chars[idx] = value[target]
+            multiplier *= decode
+
+        prefix = []
+        suffix = []
+        for idx in range(d_value):
+            char = chars[idx]
+            if not char:
+                for inner in range(d_value):
+                    if used[inner] == 0:
+                        char = value[inner]
+                        chars[idx] = char
+                        suffix.append(char)
+                        used[inner] = 1
+                        break
+            else:
+                prefix.append(char)
+
+        suffix.extend(value[d_value:])
+        suffix_string = "".join(suffix)
+        if len(suffix_string) < self._dynapath_primes(100)[0]:
+            return "".join(prefix) + suffix_string
+        return "".join(prefix) + self._dynapath_c(suffix_string, decode, encode)
+
+    def _dynapath_string_to_xa1s(self, value):
+        result = []
+        for char in value:
+            codepoint = ord(char)
+            if codepoint < 128:
+                result.append(codepoint)
+            elif codepoint < 2048:
+                result.append(128 | ((codepoint >> 7) & 15))
+                result.append(codepoint & 127)
+            elif codepoint >= 262144:
+                result.append(160)
+                result.append((codepoint >> 14) & 127)
+                result.append((codepoint >> 7) & 127)
+                result.append(codepoint & 127)
+            elif (63488 & codepoint) != 55296:
+                result.append(((codepoint >> 14) & 15) | 144)
+                result.append((codepoint >> 7) & 127)
+                result.append(codepoint & 127)
+        return result
+
+    def _dynapath_encode_normal_be(self, value, table, decode, encode, block):
+        xa1s = self._dynapath_string_to_xa1s(str(value))
+        out = []
+        digits = [0] * (block + 1)
+        remainder = len(xa1s) % block
+        full_size = len(xa1s) - remainder
+        index = 0
+
+        while index < full_size:
+            number = 0
+            for _ in range(block):
+                number = (number * decode) + xa1s[index]
+                index += 1
+            for digit_idx in range(block + 1):
+                digits[digit_idx] = number % encode
+                number //= encode
+            for digit_idx in range(block, -1, -1):
+                out.append(table[digits[digit_idx]])
+
+        if remainder > 0:
+            number = 0
+            for _ in range(remainder):
+                number = (number * decode) + xa1s[index]
+                index += 1
+            for digit_idx in range(remainder + 1):
+                digits[digit_idx] = number % encode
+                number //= encode
+            for digit_idx in range(remainder, -1, -1):
+                out.append(table[digits[digit_idx]])
+        return "".join(out)
+
+    def _dynapath_get_order_table(self, num):
+        return "3FE9jgRD4KdCyuawklqGJYmvfMn15P7US8XbxeLQtWT6OicBAopINs2Vh0HZrz"
+        #mod = int(num) % 841
+        #primes = self._dynapath_primes(100)
+        #return self._dynapath_c(
+        #    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        #    primes[mod // 29],
+        #    primes[mod % 29],
+        #)
+
+    def _dynapath_make_encode_table(self, num, size, order_table=None):
+        if order_table is None:
+            order_table = self._dynapath_get_order_table(num)
+            num //= 841
+        used = ""
+        out = []
+        for idx in range(size):
+            remain = size - idx
+            remainder = num % remain
+            found_count = 0
+            for char in order_table[:size]:
+                if char in used:
+                    continue
+                if found_count == remainder:
+                    out.append(char)
+                    used += char
+                    break
+                found_count += 1
+            num //= remain
+        return "".join(out)
+
+    def _dynapath_make_key(self, key):
+        result = 0
+        for char in key:
+            codepoint = ord(char)
+            bit = 32768
+            for _ in range(16):
+                if bit & codepoint:
+                    break
+                bit >>= 1
+            result = (result * (bit << 1)) + codepoint
+        return result
+
+    def _dynapath_prime_encode(self, source, key):
+        decode, encode, block = 161, 46, 2
+        source_is_string = isinstance(source, str)
+        order_index = (1 if source_is_string else 0) % 26
+        self._log(
+            f"order_index: {order_index} "
+        )
+        order_table = self._dynapath_get_order_table(order_index)
+        self._log(
+            f"order_table: {order_table} \n"
+            "order_table(pr): 3FE9jgRD4KdCyuawklqGJYmvfMn15P7US8XbxeLQtWT6OicBAopINs2Vh0HZrz"
+        )
+        prefix = (
+            chr(order_index + 97)
+            + order_table[decode // 62]
+            + order_table[decode % 62]
+            + order_table[block]
+            + order_table[encode - 1]
+        )
+        encoded_key = self._dynapath_encode_normal_be(
+            key, order_table, decode, encode, block
+        )
+        return (
+            prefix
+            + order_table[len(encoded_key)]
+            + encoded_key
+            + self._dynapath_encode_normal_be(
+                source,
+                self._dynapath_make_encode_table(
+                    self._dynapath_make_key(key), encode, order_table
+                ),
+                decode,
+                encode,
+                block,
+            )
+        )
+
+    def _generate_dynapath_token(self):
+        timestamp = int(time.time() * 1000)
+        self._dynapath_recent_timestamps.append(timestamp)
+        self._dynapath_recent_timestamps = self._dynapath_recent_timestamps[-5:]
+        query_items = [
+            ("ai", self._dynapath_package_name),
+            ("di", self._dynapath_android_id),
+            ("as", self._dynapath_app_signature),
+            ("su", str(self._dynapath_rooted).lower()),
+            ("dbg", str(self._dynapath_debugger).lower()),
+            ("emu", str(self._dynapath_emulator).lower()),
+            ("hk", str(self._dynapath_hooked).lower()),
+            ("it", str(self._dynapath_init_timestamp)),
+            ("ts", str(timestamp)),
+        ]
+        query_items.extend(("rt", str(value)) for value in self._dynapath_recent_timestamps)
+        query_items.extend(
+            [
+                ("os", self._dynapath_os_release),
+                ("dm", self._dynapath_device_model),
+                ("st", "Android"),
+                ("sv", "v1"),
+            ]
+        )
+        query_string = "&".join(
+            f"{quote_plus(str(key))}={quote_plus(str(value))}"
+            for key, value in query_items
+        )
+
+        token_key = f"v1+{''.join(secrets.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(4))}+{timestamp}"
+       
+        self._log(
+            f"KTX query: {query_string} "
+        )
+        return self._dynapath_prime_encode(query_string, token_key)
+
+    def _request_headers(self, endpoint):
+        headers = None
+        if (
+            not self._legacy_mode
+            and self._is_macro_active
+            and self._protected_endpoint_key(endpoint)
+        ):
+            headers = {"x-dynapath-m-token": self._generate_dynapath_token()}
+            self._log(
+                "Generated x-dynapath-m-token for "
+                f"{self._protected_endpoint_key(endpoint)}"
+            )
+        return headers
+
+    def _load_common_code(self):
+        payload = [
+            ("Device", self._device),
+            ("Version", self._version),
+            ("Key", self._key),
+            ("code", COMMON_CODE_DATA),
+            (
+                "deviceWidth",
+                os.getenv("SRTGO_KTX_DEVICE_WIDTH", str(DEFAULT_KTX_DEVICE_WIDTH)),
+            ),
+            (
+                "deviceHeight",
+                os.getenv("SRTGO_KTX_DEVICE_HEIGHT", str(DEFAULT_KTX_DEVICE_HEIGHT)),
+            ),
+            ("departDate", ""),
+            ("arrivalDate", ""),
+            ("holidayYn", "N"),
+            (
+                "OSVersion",
+                os.getenv("SRTGO_KTX_OS_VERSION", str(DEFAULT_KTX_OS_VERSION)),
+            ),
+        ]
+        j = self._request_json("POST", API_ENDPOINTS["code"], data=payload)
+        data = j.get(COMMON_CODE_DATA, {})
+        self._is_macro_active = (data.get("isMacroEnable") or "N") == "Y"
+        self._log(
+            "KTX common code loaded: "
+            f"isMacroEnable={'Y' if self._is_macro_active else 'N'}"
+        )
+        return j
 
     def __enc_password(self, password):
         url = API_ENDPOINTS["code"]
@@ -551,19 +918,37 @@ class Korail:
             ).decode("utf-8")
         return False
 
+    def _generate_sid(self):
+        sid_input = f"{self._device}{int(time.time() * 1000)}"
+        encrypt_key = SID_KEY.encode("utf-8")
+        iv = SID_KEY[:16].encode("utf-8")
+        cipher = AES.new(encrypt_key, AES.MODE_CBC, iv)
+        padded_data = pad(sid_input.encode("utf-8"), AES.block_size)
+        return base64.b64encode(cipher.encrypt(padded_data)).decode("utf-8")
+
+    def _get_login_type(self, korail_id):
+        if EMAIL_REGEX.match(korail_id):
+            return "5"
+
+        if PHONE_NUMBER_REGEX.match(korail_id):
+            return "4"
+
+        normalized = korail_id.replace("-", "").strip()
+        if PHONE_NUMBER_DIGITS_REGEX.fullmatch(normalized):
+            return "4"
+
+        return "2"
+
     def login(self, korail_id=None, korail_pw=None):
         if korail_id:
             self.korail_id = korail_id
         if korail_pw:
             self.korail_pw = korail_pw
 
-        txt_input_flg = (
-            "5"
-            if EMAIL_REGEX.match(self.korail_id)
-            else "4"
-            if PHONE_NUMBER_REGEX.match(self.korail_id)
-            else "2"
-        )
+        if not self._legacy_mode and self._is_macro_active is None:
+            self._load_common_code()
+
+        txt_input_flg = self._get_login_type(self.korail_id)
 
         data = {
             "Device": self._device,
@@ -574,12 +959,25 @@ class Korail:
             "txtInputFlg": txt_input_flg,
             "idx": self._idx,
         }
+        if not self._legacy_mode:
+            data.update(
+                {
+                    "checkValidPw": "Y",
+                    "custId": "",
+                    "etrPath": "",
+                }
+            )
 
-        r = self._session.post(API_ENDPOINTS["login"], data=data)
-        self._log(r.text)
-        j = json.loads(r.text)
+        j = self._request_json(
+            "POST",
+            API_ENDPOINTS["login"],
+            data=data,
+            headers=self._request_headers(API_ENDPOINTS["login"]),
+        )
 
-        if j["strResult"] == "SUCC" and j.get("strMbCrdNo"):
+        self._result_check(j)
+
+        if j.get("strResult") == "SUCC" and j.get("strMbCrdNo"):
             # self._key = j['Key']
             self.membership_number = j["strMbCrdNo"]
             self.name = j["strCustNm"]
@@ -590,15 +988,29 @@ class Korail:
             )
             self.logined = True
             return True
+
+        if j.get("h_msg_txt"):
+            raise KorailError(j.get("h_msg_txt"), j.get("h_msg_cd"))
+
         self.logined = False
         return False
 
     def logout(self):
-        r = self._session.get(API_ENDPOINTS["logout"])
+        endpoint = API_ENDPOINTS["logout_legacy"] if self._legacy_mode else API_ENDPOINTS["logout"]
+        r = self._session.get(endpoint)
         self._log(r.text)
         self.logined = False
 
     def _result_check(self, j):
+        if "code" in j and "message" in j:
+            error_code = str(j.get("code"))
+            error_message = j.get("message")
+            error_id = j.get("id")
+            if error_id:
+                self._log(
+                    f"KTX macro guard rejected request: code={error_code}, id={error_id}"
+                )
+            raise KorailError(error_message, error_code)
         if j.get("strResult") == "FAIL":
             h_msg_cd = j.get("h_msg_cd")
             h_msg_txt = j.get("h_msg_txt")
@@ -645,7 +1057,7 @@ class Korail:
         data = {
             "Device": self._device,
             "Version": self._version,
-            "Sid": "",
+            "Sid": "" if self._legacy_mode else self._generate_sid(),
             "txtMenuId": "11",
             "radJobId": "1",
             "selGoTrain": train_type,
@@ -668,10 +1080,36 @@ class Korail:
             "adjStnScdlOfrFlg": "N",  # 인접역 보기
             "mbCrdNo": self.membership_number,
         }
+        if not self._legacy_mode:
+            data.update(
+                {
+                    "txtGoTrnNo": "",
+                    "txtJobDv": "",
+                    "etrPath": "",
+                    "tkDptDt": "",
+                    "tkDptTm": "",
+                    "tkTrnNo": "",
+                    "tkPsrmClCd": "",
+                    "tkRcvdAmt": "",
+                    "qryDvCd": "",
+                    "qryStNo": "",
+                    "qryStTrnNo": "",
+                    "qryStTrnNo2": "",
+                    "pgPrCnt": "",
+                    "chtnCnt": "",
+                    "chtnRsStnCd1": "",
+                    "trnGpCnt": "",
+                    "trnGpCd1": "",
+                }
+            )
 
-        r = self._session.get(API_ENDPOINTS["search_schedule"], params=data)
-        self._log(r.text)
-        j = json.loads(r.text)
+        j = self._request_json(
+            "GET" if self._legacy_mode else "POST",
+            API_ENDPOINTS["search_schedule"],
+            params=data if self._legacy_mode else None,
+            data=None if self._legacy_mode else data,
+            headers=self._request_headers(API_ENDPOINTS["search_schedule"]),
+        )
 
         if self._result_check(j):
             trains = [
@@ -757,9 +1195,13 @@ class Korail:
         for i, psg in enumerate(passengers, 1):
             data.update(psg.get_dict(i))
 
-        r = self._session.get(API_ENDPOINTS["reserve"], params=data)
-        self._log(r.text)
-        j = json.loads(r.text)
+        j = self._request_json(
+            "GET" if self._legacy_mode else "POST",
+            API_ENDPOINTS["reserve"],
+            params=data if self._legacy_mode else None,
+            data=None if self._legacy_mode else data,
+            headers=self._request_headers(API_ENDPOINTS["reserve"]),
+        )
         if self._result_check(j):
             rsv_id = j.get("h_pnr_no")
             reservation = self.reservations(rsv_id)
@@ -780,9 +1222,12 @@ class Korail:
             "hiduserYn": "Y",
         }
 
-        r = self._session.get(API_ENDPOINTS["myticketlist"], params=data)
-        self._log(r.text)
-        j = json.loads(r.text)
+        j = self._request_json(
+            "GET" if self._legacy_mode else "POST",
+            API_ENDPOINTS["myticketlist"],
+            params=data if self._legacy_mode else None,
+            data=None if self._legacy_mode else data,
+        )
         try:
             if self._result_check(j):
                 tickets = []
@@ -797,8 +1242,12 @@ class Korail:
                         "h_orgtk_sale_sqno": ticket.sale_info3,
                         "h_orgtk_ret_pwd": ticket.sale_info4,
                     }
-                    r = self._session.get(API_ENDPOINTS["myticketseat"], params=data)
-                    j = json.loads(r.text)
+                    j = self._request_json(
+                        "GET" if self._legacy_mode else "POST",
+                        API_ENDPOINTS["myticketseat"],
+                        params=data if self._legacy_mode else None,
+                        data=None if self._legacy_mode else data,
+                    )
                     if self._result_check(j):
                         seat = (
                             j.get("ticket_infos", {})
@@ -818,9 +1267,7 @@ class Korail:
             "Version": self._version,
             "Key": self._key,
         }
-        r = self._session.get(API_ENDPOINTS["myreservationview"], params=data)
-        self._log(r.text)
-        j = json.loads(r.text)
+        j = self._request_json("GET", API_ENDPOINTS["myreservationview"], params=data)
         try:
             if not self._result_check(j):
                 return []
@@ -850,9 +1297,7 @@ class Korail:
             "Key": self._key,
             "hidPnrNo": rsv_id,
         }
-        r = self._session.get(API_ENDPOINTS["myreservationlist"], params=data)
-        self._log(r.text)
-        j = json.loads(r.text)
+        j = self._request_json("GET", API_ENDPOINTS["myreservationlist"], params=data)
         try:
             if not self._result_check(j):
                 return []
@@ -901,9 +1346,7 @@ class Korail:
             "hiduserYn": "Y",
         }
 
-        r = self._session.post(API_ENDPOINTS["pay"], data=data)
-        self._log(r.text)
-        j = json.loads(r.text)
+        j = self._request_json("POST", API_ENDPOINTS["pay"], data=data)
         if self._result_check(j):
             return True
         return False
@@ -920,9 +1363,7 @@ class Korail:
             "txtJrnyCnt": rsv.journey_cnt,
             "hidRsvChgNo": rsv.rsv_chg_no,
         }
-        r = self._session.post(API_ENDPOINTS["cancel"], data=data)
-        self._log(r.text)
-        j = json.loads(r.text)
+        j = self._request_json("POST", API_ENDPOINTS["cancel"], data=data)
         return self._result_check(j)
 
     def refund(self, ticket):
@@ -942,7 +1383,5 @@ class Korail:
             "latitude": "",
             "longitude": "",
         }
-        r = self._session.post(API_ENDPOINTS["refund"], data=data)
-        self._log(r.text)
-        j = json.loads(r.text)
+        j = self._request_json("POST", API_ENDPOINTS["refund"], data=data)
         return self._result_check(j)

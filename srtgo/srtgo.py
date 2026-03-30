@@ -180,7 +180,10 @@ def srtgo(debug=False):
 
         action = ACTIONS.get(choice)
         if action:
-            action(rail_type)
+            try:
+                action(rail_type)
+            except (SRTError, KorailError, ConnectionError, JSONDecodeError) as err:
+                print(err)
 
 
 def set_station(rail_type: RailType) -> bool:
@@ -424,7 +427,7 @@ def set_login(rail_type="SRT", debug=False):
         keyring.set_password(rail_type, "pass", login_info["pass"])
         keyring.set_password(rail_type, "ok", "1")
         return True
-    except SRTError as err:
+    except (SRTError, KorailError) as err:
         print(err)
         keyring.delete_password(rail_type, "ok")
         return False
